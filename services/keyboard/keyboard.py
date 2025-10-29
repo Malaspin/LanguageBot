@@ -5,7 +5,8 @@ async def keyboard_word_create(*args):
     repl_key_mark = ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text= f'{w1}'), KeyboardButton(text=f'{w2}')],
         [KeyboardButton(text= f'{w3}'), KeyboardButton(text= f'{w4}')],
-        [KeyboardButton(text='❌Удалить слово'), KeyboardButton(text='⏭️Пропустить')],
+        [KeyboardButton(text='❌Удалить слово (это прервет обучение)'), KeyboardButton(text='⏭️Пропустить')],
+        [KeyboardButton(text='➕Добавить слово (это прервет обучение)')]
         ],
         resize_keyboard=True)
     return repl_key_mark

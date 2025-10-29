@@ -2,8 +2,7 @@ import asyncio
 import json
 import random
 from database import model_db as mdl
-from sqlalchemy import select, delete
-from sqlalchemy.orm import aliased
+from sqlalchemy import select, delete, and_
 from sqlalchemy.exc import MultipleResultsFound, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from config import async_engine
@@ -33,107 +32,123 @@ class DataBaseAPI():
             await conn.commit()
 
     # Добавляем юзера, строим взаимосвязи с исходными словами
-    async def add_user(self, user_id: int, chat_id: int):
+    async def add_user(self, user_id: int):
         try:
-            add_user = {'user_id': user_id, 'chat_id': chat_id}
+            add_user = {'id': user_id}
             user_obj = mdl.Users(**add_user)
             async with self.__async_sessionmaker() as conn:
                 conn.add(user_obj)
                 await conn.commit()
-                await conn.refresh(user_obj)
-                id = user_obj.id
-                stmt = select(mdl.GeneralWords.id)
-                result_select = await conn.scalars(stmt)
-                id_words = result_select.unique().all()
-                for id in id_words:
-                    user_word = {'user_id': user_obj.id, 'general_word_id': id}
-                    add = mdl.WordsUsers(**user_word)
-                    conn.add(add)
-                await conn.commit()
         except IntegrityError:
             pass
 
-    # Добавляем индивидуальные слова юзера, строим взаимосвязь
+    # Добавляем индивидуальные слова юзера
     async def add_user_word(self, user_id: int, user_word: str, translate_word: str):
-        result_word = {'word': user_word, 'translate_word': translate_word}
-        add_word = mdl.UserWords(**result_word)
+        result_word = {'word': user_word, 'translate_word': translate_word, 'user_id': user_id}
         async with self.__async_sessionmaker() as conn:
             stmt = (
                 select(mdl.GeneralWords)
-                .where(mdl.GeneralWords.word == user_word)
+                .where((mdl.GeneralWords.word == user_word) & (mdl.GeneralWords.translate_word == translate_word))
+            )
+            stmt_blackhole = (
+                select(mdl.UserBlackHole.id)
+                .join(mdl.GeneralWords, mdl.GeneralWords.id == mdl.UserBlackHole.id_general_word)
+                .where(
+                    (mdl.GeneralWords.word == user_word) & 
+                    (mdl.UserBlackHole.user_id == user_id) &
+                    (mdl.GeneralWords.translate_word == translate_word)
+                    )
+            )
+            stmt_del_blackhole = (
+                delete(mdl.UserBlackHole)
+                .where(mdl.UserBlackHole.id.in_(stmt_blackhole))
             )
             try:
+                balchole_result = await conn.execute(stmt_blackhole)
+                id_blackhole = balchole_result.scalars().all()
+                if id_blackhole:
+                            await conn.execute(stmt_del_blackhole)
+                            await conn.commit()
                 result = await conn.execute(stmt)
-                obj = result.scalars().one_or_none()
-                if obj is not None:
+                obj = result.scalars().all()
+                if obj:
                     return "Слово не добавлено - есть в общем списке"
+                else:  
+                    add_word = mdl.UserWords(**result_word)
+                try:
+                    conn.add(add_word)
+                    await conn.commit()
+                except IntegrityError:
+                    return 'Слово не добавлено - есть в списке персональных слов'
             except MultipleResultsFound:
                 return "Слово не добавлено - есть в общей списке"
-            conn.add(add_word)
-            await conn.commit()
-            await conn.refresh(add_word)
-            pk_new_word = add_word.id
-            stmt = (
-                select(mdl.Users.id)
-                .where(mdl.Users.user_id == user_id)
-            )
-            result = await conn.execute(stmt)
-            id = result.scalar_one()
-            result_add_word_user = {'user_id': id, 'personal_word_id': pk_new_word}
-            add_word_user = mdl.WordsUsers(**result_add_word_user)
-            conn.add(add_word_user)
-            await conn.commit()
 
 
-    #Дропаем слова
+    #Дропаем слова/общие добавляем в блеклист
     async def del_user_word(self, user_id: int, user_word: str):
         async with self.__async_sessionmaker() as conn:
             stmt_user_word_id = (
             select(mdl.UserWords.id)
-            .join(mdl.WordsUsers, mdl.UserWords.id == mdl.WordsUsers.personal_word_id)
-            .join(mdl.Users, mdl.Users.id == mdl.WordsUsers.user_id)
-            .where(mdl.Users.user_id == user_id, mdl.UserWords.word == user_word)
+            .join(mdl.Users, mdl.Users.id == mdl.UserWords.user_id)
+            .where((mdl.Users.id == user_id) & (mdl.UserWords.word == user_word))
         )
             delete_user_words = (
                 delete(mdl.UserWords)
                 .where(mdl.UserWords.id.in_(stmt_user_word_id))
             )
-            await conn.execute(delete_user_words)
-            wu = aliased(mdl.WordsUsers)
-            stmt_general_word = (
-                select(wu.id)
-                .join(mdl.Users, mdl.Users.id == wu.user_id)
-                .join(mdl.GeneralWords, mdl.GeneralWords.id == wu.general_word_id)
-                .where(mdl.Users.user_id == user_id, mdl.GeneralWords.word == user_word)
+            stmt_id_general_word = (
+                select(mdl.GeneralWords.id)
+                .where(mdl.GeneralWords.word == user_word)
             )
-            del_stmt = (
-                delete(mdl.WordsUsers)
-                .where(mdl.WordsUsers.id.in_(stmt_general_word))
-            )
-            await conn.execute(del_stmt)
-            await conn.commit()
+            
+            find_user_word = await conn.execute(stmt_user_word_id)
+            user_word_id = find_user_word.scalars().all()
+            if user_word_id:
+                await conn.execute(delete_user_words)
+                await conn.commit()
 
-    #Получаем id слов пользователя
-    async def get_id_word(self, user_id: int):
-        stmt = (
-            select(mdl.WordsUsers.id)
-            .join(mdl.WordsUsers.user_word)
-            .where(mdl.Users.user_id == user_id)
+            result = await conn.execute(stmt_id_general_word)
+            id_general_word = result.scalar_one_or_none()
+            if id_general_word:
+                try:
+                    result_add_blackhole = {'id_general_word':id_general_word, 'user_id': user_id}
+                    add_blackhole = mdl.UserBlackHole(**result_add_blackhole)
+                    conn.add(add_blackhole)
+                except IntegrityError:
+                    pass
+                await conn.commit()
+
+    #Получаем слова пользователя
+    async def get_word(self, user_id: int) -> dict:
+        stmt_general = (
+            select(mdl.GeneralWords.word, mdl.GeneralWords.translate_word)
+            .outerjoin(
+                mdl.UserBlackHole,
+                and_(
+                    mdl.UserBlackHole.id_general_word == mdl.GeneralWords.id,
+                    mdl.UserBlackHole.user_id == user_id
+                )
+            )
+            .where(mdl.UserBlackHole.id_general_word.is_(None))
+        )
+        stmt_personal = (
+            select(mdl.UserWords.word, mdl.UserWords.translate_word)
+            .where(mdl.UserWords.user_id == user_id)
         )
         async with self.__async_sessionmaker() as conn:
-            result = await conn.execute(stmt)
-            id_relations = result.scalars().all()
-        return id_relations
-    
-    async def get_word_by_id(self, word_id: int):
-        async with self.__async_sessionmaker() as conn:
-            stmt = select(mdl.GeneralWords).where(mdl.GeneralWords.id == word_id)
-            result = await conn.execute(stmt)
-            return result.scalars().one_or_none()
+           result_general = await conn.execute(stmt_general)
+           word_list = result_general.all()
+           result_personal = await conn.execute(stmt_personal)
+           word_list += result_personal.all()
+           word_dict = dict(word_list)
+        return word_dict
 
     async def get_random_translations(self, exclude_word: str, count: int = 3):
         async with self.__async_sessionmaker() as conn:
-            stmt = select(mdl.GeneralWords.translate_word).where(mdl.GeneralWords.translate_word != exclude_word)
+            stmt = (
+                select(mdl.GeneralWords.translate_word)
+                .where(mdl.GeneralWords.translate_word != exclude_word)
+                )
             result = await conn.execute(stmt)
             translations = result.scalars().all()
             return random.sample(translations, min(count, len(translations)))
